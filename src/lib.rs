@@ -1,9 +1,13 @@
 use crossbeam::thread;
 use ordered_float::OrderedFloat;
+use palette::{LinSrgb, Mix};
 use rand::prelude::*;
 use std::marker::{Send, Sync};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
+use uuid::Uuid;
+
+static ROOT_IDENTIFIER: String = "r".to_string();
 
 pub trait Game: Clone + Send + Sync {
     type Move: Clone + PartialEq + Send + Sync + std::fmt::Debug;
@@ -37,6 +41,7 @@ pub trait Game: Clone + Send + Sync {
 
 struct Node<G: Game> {
     /// Move which entered this node
+    id: String,
     mov: Option<G::Move>,
     parent: Option<Arc<Node<G>>>,
     children: RwLock<Vec<Arc<Node<G>>>>,
@@ -89,6 +94,12 @@ impl<G: Game> Node<G> {
     fn add_child(self: Arc<Self>, mov: G::Move, player_tag: G::PlayerTag) -> Arc<Node<G>> {
         let p = Arc::clone(&self);
         let child = Arc::new(Node {
+            id: if true {
+                // TODO: make configurable
+                Uuid::new_v4().to_string()
+            } else {
+                ROOT_IDENTIFIER
+            },
             mov: Some(mov),
             parent: Some(p),
             children: Default::default(),
@@ -123,6 +134,12 @@ pub struct IsmctsHandler<G: Game> {
 impl<G: Game> IsmctsHandler<G> {
     pub fn new(root_state: G) -> Self {
         let root_node = Arc::new(Node {
+            id: if true {
+                // TODO: make configurable
+                Uuid::new_v4().to_string()
+            } else {
+                ROOT_IDENTIFIER
+            },
             mov: None,
             parent: None,
             children: Default::default(),
@@ -248,6 +265,79 @@ impl<G: Game> IsmctsHandler<G> {
     pub fn state(&self) -> &G {
         &self.root_state
     }
+
+    pub fn dotty_graph(&self) {
+        println!(
+            r#"digraph G {{
+            rankdir="LR";
+            node[label=""];
+            node[shape=circle,size=100,style=filled];
+            "#
+        );
+        self.dotty_all_children(&self.root_node);
+        println!("}}");
+    }
+
+    fn get_max_visits(&self, nodes: Vec<Arc<Node<G>>>) -> usize {
+        let mut max_visits = 0;
+
+        for node in nodes {
+            max_visits = max(node.statistics.read().unwrap().visit_count, max_visits);
+        }
+        return max_visits;
+    }
+
+    fn dotty_all_children(&self, root_node: &Arc<Node<G>>) {
+        let mut nodes: Vec<Arc<Node<G>>> = vec![root_node.clone()];
+        while !nodes.is_empty() {
+            let mut next_nodes = vec![];
+            let max_visits = self.get_max_visits(nodes.clone());
+            for node in nodes {
+                let visit_count = node.statistics.read().unwrap().visit_count;
+                println!(
+                    r#""{}" [fillcolor="{}",label="{}"];"#,
+                    node.id,
+                    self.dotty_node_color(&node, max_visits),
+                    visit_count,
+                );
+                for child in node.children.read().unwrap().clone() {
+                    if child.statistics.read().unwrap().visit_count == 1 {
+                        continue;
+                    }
+                    next_nodes.push(child.clone());
+                    println!(r#""{}" -> "{}";"#, node.id, child.id);
+                }
+            }
+            nodes = next_nodes;
+        }
+    }
+
+    fn dotty_node_color(&self, node: &Arc<Node<G>>, max_visits: usize) -> String {
+        let visit_count = node.statistics.read().unwrap().visit_count;
+        if visit_count == 1 {
+            "#ffffff".to_string()
+        } else {
+            return color_gradient(visit_count as f32 / max_visits as f32);
+        }
+    }
+}
+
+fn color_gradient(t: f32) -> String {
+    // Define the start and end colors
+    let red = LinSrgb::new(1.0, 0.0, 0.0);
+    let green = LinSrgb::new(0.0, 1.0, 0.0);
+
+    // Interpolate between the colors
+    let mixed_color = red.mix(&green, t);
+
+    // Convert the color to hexadecimal format
+    let (r, g, b) = mixed_color.into_components();
+    format!(
+        "#{:02X}{:02X}{:02X}",
+        (r * 255.0) as u8,
+        (g * 255.0) as u8,
+        (b * 255.0) as u8
+    )
 }
 
 fn ismcts_one_iteration<G: Game>(mut state: G, mut node: Arc<Node<G>>) {
