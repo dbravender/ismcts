@@ -3,11 +3,12 @@ use ordered_float::OrderedFloat;
 use palette::{LinSrgb, Mix};
 use rand::prelude::*;
 use std::marker::{Send, Sync};
+use std::sync::LazyLock;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-static ROOT_IDENTIFIER: String = "r".to_string();
+static ROOT_IDENTIFIER: LazyLock<String> = LazyLock::new(|| "r".to_string());
 
 pub trait Game: Clone + Send + Sync {
     type Move: Clone + PartialEq + Send + Sync + std::fmt::Debug;
@@ -98,7 +99,7 @@ impl<G: Game> Node<G> {
                 // TODO: make configurable
                 Uuid::new_v4().to_string()
             } else {
-                ROOT_IDENTIFIER
+                ROOT_IDENTIFIER.clone()
             },
             mov: Some(mov),
             parent: Some(p),
@@ -138,7 +139,7 @@ impl<G: Game> IsmctsHandler<G> {
                 // TODO: make configurable
                 Uuid::new_v4().to_string()
             } else {
-                ROOT_IDENTIFIER
+                ROOT_IDENTIFIER.clone()
             },
             mov: None,
             parent: None,
@@ -282,7 +283,7 @@ impl<G: Game> IsmctsHandler<G> {
         let mut max_visits = 0;
 
         for node in nodes {
-            max_visits = max(node.statistics.read().unwrap().visit_count, max_visits);
+            max_visits = std::cmp::max(node.statistics.read().unwrap().visit_count, max_visits);
         }
         return max_visits;
     }
