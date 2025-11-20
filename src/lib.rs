@@ -25,6 +25,13 @@ pub trait Game: Clone + Send + Sync {
 
     fn result(&self, player: Self::PlayerTag) -> Option<f64>;
 
+    /// Optional: Get prior probabilities for moves from a policy network
+    /// Returns a vector of (move, probability) pairs
+    /// If not implemented, defaults to uniform priors
+    fn move_probabilities(&self) -> Option<Vec<(Self::Move, f64)>> {
+        None
+    }
+
     fn random_rollout(&mut self) {
         let mut rng = thread_rng();
         while self.result(self.current_player()).is_none() {
@@ -47,14 +54,42 @@ struct Node<G: Game> {
     statistics: RwLock<NodeStatistics>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct NodeStatistics {
     visit_count: usize,
     availability_count: usize,
     reward: f64,
+    prior_probability: f64,
+}
+
+impl Default for NodeStatistics {
+    fn default() -> Self {
+        NodeStatistics {
+            visit_count: 0,
+            availability_count: 0,
+            reward: 0.0,
+            prior_probability: 1.0, // Default uniform prior
+        }
+    }
 }
 
 impl NodeStatistics {
+    /// PUCT formula (used in AlphaGo/AlphaZero)
+    /// Q + c_puct * P * sqrt(N_parent) / (1 + N)
+    /// where Q is average reward, P is prior probability, N is visit count
+    pub fn puct(&self, parent_visits: usize, c_puct: f64) -> f64 {
+        let q_value = if self.visit_count > 0 {
+            self.reward / self.visit_count as f64
+        } else {
+            0.0
+        };
+        let exploration = c_puct * self.prior_probability
+            * (parent_visits as f64).sqrt()
+            / (1.0 + self.visit_count as f64);
+        q_value + exploration
+    }
+
+    /// Fallback to UCB1 if priors are not available
     pub fn ucb1(&self) -> f64 {
         (self.reward / self.visit_count as f64)
             + (2.0 * (self.availability_count as f64).ln() / self.visit_count as f64).sqrt()
@@ -71,16 +106,26 @@ impl<G: Game> Node<G> {
             .collect::<Vec<_>>()
     }
 
-    fn select_child(&self, legal_moves: &[G::Move]) -> Option<Arc<Node<G>>> {
+    fn select_child(&self, legal_moves: &[G::Move], c_puct: f64) -> Option<Arc<Node<G>>> {
         let children = self.children.read().unwrap();
         let legal_children: Vec<_> = children
             .iter()
             .filter(|c| legal_moves.iter().any(|m| c.mov.as_ref().unwrap() == m))
             .collect(); // Need to enumerate twice
 
+        let parent_visits = self.statistics.read().unwrap().visit_count;
+
         let choice = legal_children
             .iter()
-            .max_by_key(|c| OrderedFloat::from(c.statistics.read().unwrap().ucb1()))
+            .max_by_key(|c| {
+                let stats = c.statistics.read().unwrap();
+                // Use PUCT if we have policy priors, otherwise fall back to UCB1
+                if stats.prior_probability < 1.0 {
+                    OrderedFloat::from(stats.puct(parent_visits, c_puct))
+                } else {
+                    OrderedFloat::from(stats.ucb1())
+                }
+            })
             .cloned();
         // To avoid backprop needing to recalculate/store which nodes were available, update availablity count now
         legal_children
@@ -89,7 +134,12 @@ impl<G: Game> Node<G> {
         choice.cloned()
     }
 
-    fn add_child(self: Arc<Self>, mov: G::Move, player_tag: G::PlayerTag) -> Arc<Node<G>> {
+    fn add_child(
+        self: Arc<Self>,
+        mov: G::Move,
+        player_tag: G::PlayerTag,
+        prior: f64,
+    ) -> Arc<Node<G>> {
         // Obtain a write lock on children to ensure that no other thread can add a child at the same time
         let mut children = self.children.write().unwrap();
 
@@ -109,6 +159,7 @@ impl<G: Game> Node<G> {
                 // but the visit count _is_ updated during backprop, so the availability
                 // of the new node needs a +1 because expansion happens after selection.
                 availability_count: 1,
+                prior_probability: prior,
                 ..Default::default()
             }),
         });
@@ -130,10 +181,15 @@ impl<G: Game> Node<G> {
 pub struct IsmctsHandler<G: Game> {
     root_state: G,
     root_node: Arc<Node<G>>,
+    c_puct: f64, // Exploration constant for PUCT formula
 }
 
 impl<G: Game> IsmctsHandler<G> {
     pub fn new(root_state: G) -> Self {
+        Self::new_with_puct(root_state, 1.0)
+    }
+
+    pub fn new_with_puct(root_state: G, c_puct: f64) -> Self {
         let root_node = Arc::new(Node {
             mov: None,
             parent: None,
@@ -144,6 +200,7 @@ impl<G: Game> IsmctsHandler<G> {
         IsmctsHandler {
             root_state,
             root_node,
+            c_puct,
         }
     }
 
@@ -167,18 +224,26 @@ impl<G: Game> IsmctsHandler<G> {
     }
 
     pub fn run_iterations(&mut self, n_threads: usize, n_iterations_per_thread: usize) {
+        let c_puct = self.c_puct;
         spawn_n_threads(n_threads, |_| {
             ismcts_work_thread_iterations(
                 self.root_state.clone(),
                 Arc::clone(&self.root_node),
                 n_iterations_per_thread,
+                c_puct,
             )
         });
     }
 
     pub fn run_timed(&mut self, n_threads: usize, time: Duration) {
+        let c_puct = self.c_puct;
         spawn_n_threads(n_threads, |_| {
-            ismcts_work_thread_timed(self.root_state.clone(), Arc::clone(&self.root_node), time)
+            ismcts_work_thread_timed(
+                self.root_state.clone(),
+                Arc::clone(&self.root_node),
+                time,
+                c_puct,
+            )
         });
     }
 
@@ -206,7 +271,7 @@ impl<G: Game> IsmctsHandler<G> {
             dbg!(&node.mov);
             dbg!(&node.statistics.read().unwrap());
 
-            node = node.select_child(&available_moves).unwrap();
+            node = node.select_child(&available_moves, self.c_puct).unwrap();
             state.make_move(&node.mov.clone().unwrap());
             available_moves = state.available_moves().into_iter().collect();
             depth += 1;
@@ -262,7 +327,7 @@ impl<G: Game> IsmctsHandler<G> {
     }
 }
 
-fn ismcts_one_iteration<G: Game>(mut state: G, mut node: Arc<Node<G>>) {
+fn ismcts_one_iteration<G: Game>(mut state: G, mut node: Arc<Node<G>>, c_puct: f64) {
     let mut rng = thread_rng();
 
     // Determinize
@@ -277,15 +342,29 @@ fn ismcts_one_iteration<G: Game>(mut state: G, mut node: Arc<Node<G>>) {
         if available_moves.is_empty() || !untried_moves.is_empty() {
             break;
         }
-        node = node.select_child(&available_moves).unwrap();
+        node = node.select_child(&available_moves, c_puct).unwrap();
         state.make_move(&node.mov.clone().unwrap());
     }
 
     //Expand
     if let Some(m) = untried_moves.into_iter().choose(&mut rng) {
         let player_tag = state.current_player();
+
+        // Get policy priors from the game state if available
+        let prior = if let Some(move_probs) = state.move_probabilities() {
+            // Find the prior for this move
+            move_probs
+                .iter()
+                .find(|(mov, _)| *mov == m)
+                .map(|(_, p)| *p)
+                .unwrap_or(1.0 / available_moves.len() as f64)
+        } else {
+            // Uniform prior if no policy network available
+            1.0 / available_moves.len() as f64
+        };
+
         state.make_move(&m);
-        node = node.add_child(m, player_tag);
+        node = node.add_child(m, player_tag, prior);
     }
 
     //Simulate
@@ -308,16 +387,22 @@ fn ismcts_work_thread_iterations<G: Game>(
     root_state: G,
     root_node: Arc<Node<G>>,
     n_iterations: usize,
+    c_puct: f64,
 ) {
     for _i in 0..n_iterations {
         let state = root_state.clone();
         let node = Arc::clone(&root_node);
 
-        ismcts_one_iteration(state, node);
+        ismcts_one_iteration(state, node, c_puct);
     }
 }
 
-fn ismcts_work_thread_timed<G: Game>(root_state: G, root_node: Arc<Node<G>>, time: Duration) {
+fn ismcts_work_thread_timed<G: Game>(
+    root_state: G,
+    root_node: Arc<Node<G>>,
+    time: Duration,
+    c_puct: f64,
+) {
     let start = Instant::now();
     loop {
         let duration = start.elapsed();
@@ -327,7 +412,7 @@ fn ismcts_work_thread_timed<G: Game>(root_state: G, root_node: Arc<Node<G>>, tim
         let state = root_state.clone();
         let node = Arc::clone(&root_node);
 
-        ismcts_one_iteration(state, node);
+        ismcts_one_iteration(state, node, c_puct);
     }
 }
 
