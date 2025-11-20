@@ -37,6 +37,13 @@ pub trait Game: Clone + Send + Sync {
         None
     }
 
+    /// Optional: Get value estimate from a value network for current position
+    /// Returns expected value from current player's perspective in range [-1, 1]
+    /// If not implemented, falls back to random rollout
+    fn value_estimate(&self) -> Option<f64> {
+        None
+    }
+
     fn random_rollout(&mut self) {
         let mut rng = thread_rng();
         while self.result(self.current_player()).is_none() {
@@ -187,6 +194,12 @@ impl<G: Game> Node<G> {
         if let Some(p) = &self.player_just_moved {
             statistics.reward += terminal_state.result(*p).unwrap_or_default();
         }
+    }
+
+    fn update_with_value(&self, value: f64) {
+        let mut statistics = self.statistics.write().unwrap();
+        statistics.visit_count += 1;
+        statistics.reward += value;
     }
 }
 
@@ -458,13 +471,20 @@ fn ismcts_one_iteration<G: Game>(mut state: G, mut node: Arc<Node<G>>, c_puct: f
         node = node.add_child(m, player_tag, prior);
     }
 
-    //Simulate
-    state.random_rollout();
+    //Simulate - use value network if available, otherwise rollout
+    let value = if let Some(v) = state.value_estimate() {
+        // Use value network estimate
+        v
+    } else {
+        // Fall back to random rollout
+        state.random_rollout();
+        state.result(node.player_just_moved.unwrap()).unwrap_or_default()
+    };
 
     //Backprop
     let mut backprop_node = node;
     loop {
-        backprop_node.update(&state);
+        backprop_node.update_with_value(value);
         let parent = backprop_node.parent.as_ref().and_then(Weak::upgrade);
         if let Some(n) = parent {
             backprop_node = n;
