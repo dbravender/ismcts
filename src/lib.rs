@@ -3,12 +3,9 @@ use ordered_float::OrderedFloat;
 use palette::{LinSrgb, Mix};
 use rand::prelude::*;
 use std::marker::{Send, Sync};
-use std::sync::LazyLock;
 use std::sync::{Arc, RwLock, Weak};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
-
-static ROOT_IDENTIFIER: LazyLock<String> = LazyLock::new(|| "r".to_string());
 
 #[cfg(test)]
 mod tests;
@@ -65,6 +62,7 @@ struct Node<G: Game> {
     children: RwLock<Vec<Arc<Node<G>>>>,
     player_just_moved: Option<G::PlayerTag>,
     statistics: RwLock<NodeStatistics>,
+    generate_node_ids: bool,
 }
 
 #[derive(Debug)]
@@ -96,8 +94,7 @@ impl NodeStatistics {
         } else {
             0.0
         };
-        let exploration = c_puct * self.prior_probability
-            * (parent_visits as f64).sqrt()
+        let exploration = c_puct * self.prior_probability * (parent_visits as f64).sqrt()
             / (1.0 + self.visit_count as f64);
         q_value + exploration
     }
@@ -162,12 +159,12 @@ impl<G: Game> Node<G> {
         }
 
         let p = Arc::downgrade(&self);
+        let generate_node_ids = self.generate_node_ids;
         let child = Arc::new(Node {
-            id: if true {
-                // TODO: make configurable
+            id: if generate_node_ids {
                 Uuid::new_v4().to_string()
             } else {
-                ROOT_IDENTIFIER.clone()
+                String::new()
             },
             mov: Some(mov),
             parent: Some(p),
@@ -181,19 +178,11 @@ impl<G: Game> Node<G> {
                 prior_probability: prior,
                 ..Default::default()
             }),
+            generate_node_ids,
         });
 
         children.push(Arc::clone(&child));
         child
-    }
-
-    fn update(&self, terminal_state: &G) {
-        let mut statistics = self.statistics.write().unwrap();
-
-        statistics.visit_count += 1;
-        if let Some(p) = &self.player_just_moved {
-            statistics.reward += terminal_state.result(*p).unwrap_or_default();
-        }
     }
 
     fn update_with_value(&self, value: f64) {
@@ -211,22 +200,30 @@ pub struct IsmctsHandler<G: Game> {
 
 impl<G: Game> IsmctsHandler<G> {
     pub fn new(root_state: G) -> Self {
-        Self::new_with_puct(root_state, 1.0)
+        Self::new_with_config(root_state, 1.0, false)
     }
 
     pub fn new_with_puct(root_state: G, c_puct: f64) -> Self {
+        Self::new_with_config(root_state, c_puct, false)
+    }
+
+    pub fn new_with_graph_support(root_state: G) -> Self {
+        Self::new_with_config(root_state, 1.0, true)
+    }
+
+    pub fn new_with_config(root_state: G, c_puct: f64, generate_node_ids: bool) -> Self {
         let root_node = Arc::new(Node {
-            id: if true {
-                // TODO: make configurable
+            id: if generate_node_ids {
                 Uuid::new_v4().to_string()
             } else {
-                ROOT_IDENTIFIER.clone()
+                String::new()
             },
             mov: None,
             parent: None,
             children: Default::default(),
             player_just_moved: None,
             statistics: Default::default(),
+            generate_node_ids,
         });
         IsmctsHandler {
             root_state,
@@ -358,15 +355,21 @@ impl<G: Game> IsmctsHandler<G> {
     }
 
     pub fn dotty_graph(&self) {
-        println!(
-            r#"digraph G {{
+        println!("{}", self.dotty_graph_string());
+    }
+
+    pub fn dotty_graph_string(&self) -> String {
+        let mut output = String::new();
+        output.push_str(
+            r#"digraph G {
             rankdir="LR";
             node[label=""];
             node[shape=circle,size=100,style=filled];
-            "#
+            "#,
         );
-        self.dotty_all_children(&self.root_node);
-        println!("}}");
+        self.dotty_all_children_string(&self.root_node, &mut output);
+        output.push_str("}\n");
+        output
     }
 
     fn get_max_visits(&self, nodes: Vec<Arc<Node<G>>>) -> usize {
@@ -375,28 +378,33 @@ impl<G: Game> IsmctsHandler<G> {
         for node in nodes {
             max_visits = std::cmp::max(node.statistics.read().unwrap().visit_count, max_visits);
         }
-        return max_visits;
+        max_visits
     }
 
-    fn dotty_all_children(&self, root_node: &Arc<Node<G>>) {
+    fn dotty_all_children_string(&self, root_node: &Arc<Node<G>>, output: &mut String) {
         let mut nodes: Vec<Arc<Node<G>>> = vec![root_node.clone()];
         while !nodes.is_empty() {
             let mut next_nodes = vec![];
             let max_visits = self.get_max_visits(nodes.clone());
             for node in nodes {
                 let visit_count = node.statistics.read().unwrap().visit_count;
-                println!(
-                    r#""{}" [fillcolor="{}",label="{}"];"#,
+                output.push_str(&format!(
+                    r#""{}" [fillcolor="{}",label="{}"];
+"#,
                     node.id,
                     self.dotty_node_color(&node, max_visits),
                     visit_count,
-                );
+                ));
                 for child in node.children.read().unwrap().clone() {
                     if child.statistics.read().unwrap().visit_count == 1 {
                         continue;
                     }
                     next_nodes.push(child.clone());
-                    println!(r#""{}" -> "{}";"#, node.id, child.id);
+                    output.push_str(&format!(
+                        r#""{}" -> "{}";
+"#,
+                        node.id, child.id
+                    ));
                 }
             }
             nodes = next_nodes;
@@ -408,7 +416,7 @@ impl<G: Game> IsmctsHandler<G> {
         if visit_count == 1 {
             "#ffffff".to_string()
         } else {
-            return color_gradient(visit_count as f32 / max_visits as f32);
+            color_gradient(visit_count as f32 / max_visits as f32)
         }
     }
 }
@@ -463,8 +471,8 @@ fn ismcts_one_iteration<G: Game>(mut state: G, mut node: Arc<Node<G>>, c_puct: f
                 .map(|(_, p)| *p)
                 .unwrap_or(1.0 / available_moves.len() as f64)
         } else {
-            // Uniform prior if no policy network available
-            1.0 / available_moves.len() as f64
+            // No policy network - use default prior (1.0) to maintain UCB1 behavior
+            1.0
         };
 
         state.make_move(&m);
@@ -478,7 +486,9 @@ fn ismcts_one_iteration<G: Game>(mut state: G, mut node: Arc<Node<G>>, c_puct: f
     } else {
         // Fall back to random rollout
         state.random_rollout();
-        state.result(node.player_just_moved.unwrap()).unwrap_or_default()
+        state
+            .result(node.player_just_moved.unwrap())
+            .unwrap_or_default()
     };
 
     //Backprop
