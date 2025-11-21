@@ -68,8 +68,8 @@ pub trait Game: Clone + Send + Sync {
 }
 
 struct Node<G: Game> {
-    /// Move which entered this node
-    id: String,
+    /// Move which entered this node (None if not generating IDs)
+    id: Option<String>,
     mov: Option<G::Move>,
     parent: Option<Weak<Node<G>>>,
     children: RwLock<Vec<Arc<Node<G>>>>,
@@ -175,9 +175,9 @@ impl<G: Game> Node<G> {
         let generate_node_ids = self.generate_node_ids;
         let child = Arc::new(Node {
             id: if generate_node_ids {
-                Uuid::new_v4().to_string()
+                Some(Uuid::new_v4().to_string())
             } else {
-                String::new()
+                None
             },
             mov: Some(mov),
             parent: Some(p),
@@ -235,9 +235,9 @@ impl<G: Game> IsmctsHandler<G> {
     pub fn new_with_config(root_state: G, c_puct: f64, generate_node_ids: bool) -> Self {
         let root_node = Arc::new(Node {
             id: if generate_node_ids {
-                Uuid::new_v4().to_string()
+                Some(Uuid::new_v4().to_string())
             } else {
-                String::new()
+                None
             },
             mov: None,
             parent: None,
@@ -412,7 +412,7 @@ impl<G: Game> IsmctsHandler<G> {
                 output.push_str(&format!(
                     r#""{}" [fillcolor="{}",label="{}"];
 "#,
-                    node.id,
+                    node.id.as_ref().unwrap(),
                     self.dotty_node_color(&node, max_visits),
                     visit_count,
                 ));
@@ -424,7 +424,8 @@ impl<G: Game> IsmctsHandler<G> {
                     output.push_str(&format!(
                         r#""{}" -> "{}";
 "#,
-                        node.id, child.id
+                        node.id.as_ref().unwrap(),
+                        child.id.as_ref().unwrap()
                     ));
                 }
             }

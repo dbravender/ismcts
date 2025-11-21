@@ -193,13 +193,13 @@ fn test_graph_ids_enabled() {
     ismcts.run_iterations(1, 100);
 
     // Check that root node has an ID
-    assert!(!ismcts.root_node.id.is_empty());
+    assert!(ismcts.root_node.id.is_some());
     assert!(ismcts.root_node.generate_node_ids);
 
     // Check that children have IDs
     let children = ismcts.root_node.children.read().unwrap();
     for child in children.iter() {
-        assert!(!child.id.is_empty());
+        assert!(child.id.is_some());
         assert!(child.generate_node_ids);
     }
 }
@@ -211,13 +211,13 @@ fn test_graph_ids_disabled() {
     ismcts.run_iterations(1, 100);
 
     // Check that root node has an empty ID
-    assert!(ismcts.root_node.id.is_empty());
+    assert!(ismcts.root_node.id.is_none());
     assert!(!ismcts.root_node.generate_node_ids);
 
     // Check that children have empty IDs
     let children = ismcts.root_node.children.read().unwrap();
     for child in children.iter() {
-        assert!(child.id.is_empty());
+        assert!(child.id.is_none());
         assert!(!child.generate_node_ids);
     }
 }
@@ -361,7 +361,7 @@ fn test_combined_policy_and_value() {
 
     // Check IDs are generated
     for child in children.iter() {
-        assert!(!child.id.is_empty());
+        assert!(child.id.is_some());
 
         // Check priors are set
         let stats = child.statistics.read().unwrap();
@@ -376,8 +376,8 @@ fn test_dotty_graph_generation_with_ids() {
     ismcts.run_iterations(1, 100);
 
     // Verify root and children have IDs
-    assert!(!ismcts.root_node.id.is_empty());
-    let root_id = ismcts.root_node.id.clone();
+    assert!(ismcts.root_node.id.is_some());
+    let root_id = ismcts.root_node.id.as_ref().unwrap().clone();
 
     let children = ismcts.root_node.children.read().unwrap();
     assert!(children.len() > 0, "Should have explored some children");
@@ -386,10 +386,10 @@ fn test_dotty_graph_generation_with_ids() {
     let mut child_ids = Vec::new();
     for child in children.iter() {
         assert!(
-            !child.id.is_empty(),
+            child.id.is_some(),
             "Child node ID should not be empty for graph generation"
         );
-        child_ids.push(child.id.clone());
+        child_ids.push(child.id.as_ref().unwrap().clone());
     }
     drop(children); // Release the lock
 
@@ -442,12 +442,12 @@ fn test_graph_disabled_has_empty_ids() {
     ismcts.run_iterations(1, 100);
 
     // When graph support is disabled, IDs should be empty
-    assert!(ismcts.root_node.id.is_empty());
+    assert!(ismcts.root_node.id.is_none());
 
     let children = ismcts.root_node.children.read().unwrap();
     for child in children.iter() {
         assert!(
-            child.id.is_empty(),
+            child.id.is_none(),
             "Child IDs should be empty when graph support is disabled"
         );
     }
