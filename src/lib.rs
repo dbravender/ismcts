@@ -12,7 +12,7 @@ mod tests;
 
 pub trait Game: Clone + Send + Sync {
     type Move: Clone + PartialEq + Send + Sync + std::fmt::Debug;
-    type PlayerTag: Clone + Copy + Send + Sync + std::fmt::Debug;
+    type PlayerTag: Clone + Copy + PartialEq + Send + Sync + std::fmt::Debug;
     type MoveList: Clone + std::iter::IntoIterator<Item = Self::Move>;
 
     fn randomize_determination(&mut self, observer: Self::PlayerTag);
@@ -35,8 +35,21 @@ pub trait Game: Clone + Send + Sync {
     }
 
     /// Optional: Get value estimate from a value network for current position
+    ///
     /// Returns expected value from current player's perspective in range [-1, 1]
     /// If not implemented, falls back to random rollout
+    ///
+    /// # Two-Player Zero-Sum Assumption
+    ///
+    /// When using value networks, the implementation assumes two-player zero-sum games.
+    /// The value is automatically negated when backpropagating to opponent nodes.
+    /// For non-zero-sum games, use rollouts instead (don't implement this method).
+    ///
+    /// # Example
+    ///
+    /// If current player is Player A and the value estimate is +0.8:
+    /// - Nodes where Player A moved will receive +0.8
+    /// - Nodes where Player B moved will receive -0.8
     fn value_estimate(&self) -> Option<f64> {
         None
     }
@@ -189,6 +202,14 @@ impl<G: Game> Node<G> {
         let mut statistics = self.statistics.write().unwrap();
         statistics.visit_count += 1;
         statistics.reward += value;
+    }
+
+    fn update(&self, terminal_state: &G) {
+        let mut statistics = self.statistics.write().unwrap();
+        statistics.visit_count += 1;
+        if let Some(p) = &self.player_just_moved {
+            statistics.reward += terminal_state.result(*p).unwrap_or_default();
+        }
     }
 }
 
@@ -480,26 +501,46 @@ fn ismcts_one_iteration<G: Game>(mut state: G, mut node: Arc<Node<G>>, c_puct: f
     }
 
     //Simulate - use value network if available, otherwise rollout
-    let value = if let Some(v) = state.value_estimate() {
+    if let Some(v) = state.value_estimate() {
         // Use value network estimate
-        v
+        // Value is from current player's perspective (who is about to move)
+        let value_player = state.current_player();
+
+        // Backprop with perspective conversion for two-player zero-sum games
+        let mut backprop_node = node;
+        loop {
+            // For each node, convert value to that node's player's perspective
+            let node_value = match &backprop_node.player_just_moved {
+                Some(p) if *p == value_player => v, // Same player: use value as-is
+                Some(_) => -v, // Different player: negate (assumes two-player zero-sum)
+                None => v,     // Root node: use value as-is
+            };
+
+            backprop_node.update_with_value(node_value);
+
+            let parent = backprop_node.parent.as_ref().and_then(Weak::upgrade);
+            if let Some(n) = parent {
+                backprop_node = n;
+            } else {
+                break;
+            }
+        }
     } else {
         // Fall back to random rollout
+        // For rollouts, we query the terminal state for each player individually
         state.random_rollout();
-        state
-            .result(node.player_just_moved.unwrap())
-            .unwrap_or_default()
-    };
 
-    //Backprop
-    let mut backprop_node = node;
-    loop {
-        backprop_node.update_with_value(value);
-        let parent = backprop_node.parent.as_ref().and_then(Weak::upgrade);
-        if let Some(n) = parent {
-            backprop_node = n;
-        } else {
-            break;
+        // Backprop using terminal state (each node gets its player's result)
+        let mut backprop_node = node;
+        loop {
+            backprop_node.update(&state);
+
+            let parent = backprop_node.parent.as_ref().and_then(Weak::upgrade);
+            if let Some(n) = parent {
+                backprop_node = n;
+            } else {
+                break;
+            }
         }
     }
 }
